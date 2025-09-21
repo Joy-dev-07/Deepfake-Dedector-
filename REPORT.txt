@@ -1,0 +1,186 @@
+# Deepfake Detector – Project Report
+
+## Executive summary
+
+This project is a small, local-first deepfake checker. Users upload an image (or small video) via a React web app. A lightweight Node/Express proxy safely sends the file to Google Gemini (Generative Language API) and returns a normalized result: Real vs Fake with a confidence score. Optionally, the frontend saves a record of each detection to Supabase and displays the cloud-backed history.
+
+Key points:
+- Frontend: Vite + React + TypeScript (port 8080 by default)
+- Backend: Node + Express proxy (port 4001 by default)
+- AI: Google Generative Language API (Gemini) using HTTP generateContent
+- Storage: Supabase (optional) for history via browser (anon key)
+- Safety: API key stays server-side; browser uses a proxy for Gemini. Supabase writes are from the browser and require permissive RLS.
+
+## Repository structure
+
+```
+d:\deepfake-detector
+├─ README.md                 # simple how-to-run guide (Windows)
+├─ REPORT.md                 # this report
+├─ backend/                  # Node/Express proxy (Gemini)
+│  ├─ .env                   # GEMINI_* and (disabled) SUPABASE backend flags
+│  ├─ package.json           # express, multer, axios, cors, dotenv
+│  └─ server.js              # POST /api/detect + (legacy) /api/history
+└─ deepfake-insight-dash/    # frontend (Vite React TS)
+   ├─ .env.example           # Vite config for proxy + Supabase client
+   ├─ package.json           # dev/build scripts
+   ├─ vite.config.ts         # host ::, port 8080
+   └─ src/
+      ├─ components/
+      │  ├─ UploadSection.tsx     # upload UI, calls proxy, then saves to Supabase
+      │  ├─ ResultsDisplay.tsx     # reads lastDetection from localStorage, instant UI
+      │  ├─ HistorySection.tsx     # reads history directly from Supabase
+      │  └─ Sidebar.tsx            # mirrors “Recent History” from Supabase
+      └─ lib/
+         ├─ api.ts                 # proxy call helper (Gemini via backend)
+         └─ supabase.ts            # Supabase client (browser)
+```
+
+## System architecture
+
+1) User selects a file in the browser (React app).
+2) Frontend posts the file (multipart/form-data) to the local proxy at `POST /api/detect`.
+3) Proxy converts file to base64 and calls Gemini (AI Studio Generative Language API `generateContent`).
+4) Proxy normalizes Gemini’s response to `{ filename, result, confidence }` and returns it.
+5) Frontend immediately:
+   - Updates `localStorage.lastDetection` so `ResultsDisplay` shows the result instantly.
+   - Inserts a new row in Supabase (file, result, confidence) so History is cloud-backed.
+6) History UI (table + sidebar) queries Supabase directly to show the latest entries.
+
+Notes:
+- The backend also includes GET/DELETE `/api/history` (legacy). Current UI fetches history from Supabase directly.
+- Max upload size is 20 MB on both client and server to avoid heavy payloads.
+
+## Data flow diagrams (textual)
+
+Upload/analysis:
+- Browser → POST /api/detect (file)
+- Proxy → Gemini generateContent (image/video inline_data)
+- Proxy → Browser response: `{ filename, result('Real'|'Fake'), confidence(number) }`
+- Browser → localStorage.lastDetection update for immediate UI
+- Browser → Supabase insert `{ file, result, confidence }`
+
+History read:
+- Browser → Supabase select `select * from <table> order by created_at desc limit 200`
+- Browser UI renders both the list and the sidebar from this data
+
+## Configuration
+
+Backend (`backend/.env`):
+- `PORT=4001`
+- `GEMINI_API_KEY=...` (required)
+- `GEMINI_API_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent` (default works)
+- `GEMINI_MODEL=gemini-1.5-flash` (fallbacks exist)
+- `SUPABASE_ENABLE=false` (frontend owns Supabase)
+
+Frontend (`deepfake-insight-dash/.env`):
+- `VITE_USE_PROXY=true`
+- `VITE_PROXY_URL=http://localhost:4001/api/detect`
+- `VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co` (optional)
+- `VITE_SUPABASE_ANON_KEY=YOUR-ANON-KEY` (optional)
+- `VITE_SUPABASE_TABLE=file_results` (default)
+
+Supabase table (minimal schema used by this app):
+```sql
+CREATE TABLE public.file_results (
+  id          bigint primary key generated always as identity,
+  file        text NOT NULL,
+  result      text,
+  confidence  numeric,
+  created_at  timestamp with time zone DEFAULT now()
+);
+
+ALTER TABLE public.file_results ENABLE ROW LEVEL SECURITY;
+-- Allow SELECT/INSERT from the browser (anon key). Enable DELETE only if desired.
+CREATE POLICY "Allow anon select" ON public.file_results FOR SELECT TO anon USING (true);
+CREATE POLICY "Allow anon insert" ON public.file_results FOR INSERT TO anon WITH CHECK (true);
+-- Optional (only if you really want Clear History from browser):
+-- CREATE POLICY "Allow anon delete" ON public.file_results FOR DELETE TO anon USING (true);
+```
+
+## How to run (Windows, PowerShell)
+
+Backend proxy (one-time install then run):
+1. `cd d:\deepfake-detector\backend`
+2. `npm install`
+3. Ensure `.env` contains a valid `GEMINI_API_KEY`
+4. `node server.js` → expect: “Proxy listening on 4001”
+
+Frontend (one-time install then run):
+1. `cd d:\deepfake-detector\deepfake-insight-dash`
+2. `npm install`
+3. Create `.env` with Vite vars (see Configuration)
+4. `npm run dev` → open http://localhost:8080
+
+Using the app:
+1. Click “Choose File” and select a small image (JPG/PNG) or small video (MP4)
+2. Wait for the result (ResultsDisplay shows immediately from localStorage)
+3. History and Sidebar refresh from Supabase if configured
+
+## Frontend components
+
+- `UploadSection.tsx`
+  - Validates file type + size (<= 20 MB)
+  - For images, reads a thumbnail data URL (stored locally for the Results view)
+  - Calls proxy → receives `{ result, confidence }`
+  - Saves `lastDetection` to localStorage for instant display
+  - Inserts `{ file, result, confidence }` into Supabase (if configured)
+
+- `ResultsDisplay.tsx`
+  - Reads only `localStorage.lastDetection`
+  - Normalizes confidence to 0–100 and shows a progress bar & badge
+
+- `HistorySection.tsx`
+  - Fetches directly from Supabase: recent rows ordered by `created_at`
+  - Displays filename, result badge, confidence %, relative date
+  - Clear History calls a Supabase delete (policy must allow it)
+
+- `Sidebar.tsx`
+  - Mirrors History: fetches recent detections from Supabase
+  - Shows a compact list for quick glance
+
+## Backend endpoints
+
+- `POST /api/detect`
+  - Body: multipart/form-data with `file`
+  - Behavior: base64-encodes file → Gemini `generateContent`
+  - Response `{ filename, result, confidence, raw }`
+
+- `GET /api/history` and `DELETE /api/history`
+  - Legacy convenience endpoints (not used by the current UI)
+  - Current UI reads/writes history via Supabase directly
+
+## Security considerations
+
+- Do not expose Gemini API key in the browser. The proxy hides it server-side.
+- Supabase browser writes use the anon key + permissive RLS policies. Limit as needed.
+- Do not commit `.env` files with real secrets. Use local-only `.env` files.
+- Uploaded files are not stored server-side; they’re only forwarded to Gemini.
+- Large files are blocked at 20 MB to reduce risk/performance issues.
+
+## Limitations & known issues
+
+- Gemini video analysis via `inline_data` can be slow and/or size-limited. Prefer small files.
+- Confidence is model-derived; scaling is normalized, but values may vary by prompt/model.
+- Browser localStorage persists only the last detection (for instant UI). History is in Supabase if configured.
+- Without Supabase policies for SELECT/INSERT (and/or DELETE), history features won’t work in the browser.
+
+## Troubleshooting
+
+- “All Gemini endpoints failed”: check `GEMINI_API_KEY` and that the backend prints the endpoint it used. Ensure internet access and correct endpoint URL.
+- “Unsupported file type”: ensure the file is image/* or video/*; rename uncommon extensions to .jpg/.png/.mp4 if needed.
+- History not loading: ensure Vite env values are set (URL, anon key, table) and that Supabase SELECT policy is enabled.
+- Clear History not working: add a DELETE policy or remove the button.
+- Vite doesn’t open: verify the dev server is on 8080 and no firewall is blocking.
+
+## Next steps (nice-to-haves)
+
+- Generate and store a compressed thumbnail for faster history previews.
+- Add user auth to keep separate, private histories per user.
+- Add retries and backoff for Gemini and Supabase operations.
+- Add basic unit tests for response normalization and UI state.
+- Provide a small health-check page for the proxy.
+
+---
+
+If you want this report in a different format (PDF outline, checklist, or slide-style), tell me the template and I’ll adapt the content.
