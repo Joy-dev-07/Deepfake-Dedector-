@@ -1,62 +1,46 @@
-Deepfake Detector – Super Simple Guide
+# Deepfake Insight Dash — Local quickstart
 
-Hi! This is a tiny app that checks pictures (and some videos) and tells you if they look real or fake.
+Tiny README with the minimal steps to run this repo locally (Windows PowerShell examples).
 
-You will run two parts:
-- The helper server (backend) that talks to Google Gemini.
-- The website (frontend) that you open in your browser.
+1) Prerequisites
+	- Node.js (16+) and npm installed
+	- A Gemini API key (server-side) if you want to test real model calls
 
-What you need
-- A Windows PC
-- Node.js installed (from nodejs.org)
-- A Google Gemini API key
-- A Supabase project (optional, for saving history)
+2) Install frontend deps
+	Open PowerShell in the project folder `deepfake-insight-dash` and run:
 
-Step 1: Start the helper server
-1) Open PowerShell
-2) Go to the backend folder:
-	- cd d:\deepfake-detector\backend
-3) Put your Gemini key in the file .env
-	- Open the file d:\deepfake-detector\backend\.env
-	- Find GEMINI_API_KEY=...
-	- Paste your real key after =
-4) Install packages (do this once):
-	- npm install
-5) Start the server:
-	- node server.js
-6) You should see: Proxy listening on 4001
+```powershell
+npm install
+```
 
-Step 2: Start the website
-1) Open another PowerShell window
-2) Go to the website folder:
-	- cd d:\deepfake-detector\deepfake-insight-dash
-3) Install packages (do this once):
-	- npm install
-4) (Optional) Make a .env file to save history in Supabase
-	- Create a new file: d:\deepfake-detector\deepfake-insight-dash\.env
-	- Put these lines (change YOUR-PROJECT and YOUR-KEY):
-	  VITE_USE_PROXY=true
-	  VITE_PROXY_URL=http://localhost:4001/api/detect
-	  VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
-	  VITE_SUPABASE_ANON_KEY=YOUR-KEY
-	  VITE_SUPABASE_TABLE=file_results
-5) Start the website:
-	- npm run dev
-6) Open your browser and go to:
-	- http://localhost:8080
+3) Start the backend proxy (recommended, hides your Gemini key)
+	- Edit `backend/.env` and set `GEMINI_API_KEY` to your Gemini key. Keep the file private.
+	- From repo root run:
 
-Step 3: Use it
-1) Click “Choose File”
-2) Pick a small image (JPG/PNG). You can also try a small video (MP4)
-3) Wait a moment. It will show:
-	- REAL or FAKE
-	- A confidence number
-4) If you set Supabase, your history will show in the History page and sidebar.
+```powershell
+Set-Location -Path .\backend
+$env:PORT='4001'  # optional override
+node server.js
+```
 
-Small tips
-- If the page doesn’t open, make sure the website says it is running on 8080, and the server says “Proxy listening on 4001”.
-- If uploads don’t work, try smaller files (under 20 MB).
-- If history is empty, check your Supabase .env values and your database table file_results.
-- Your data is only for testing on your computer.
+4) Start the frontend dev server
 
-That’s it! You can now test images and see results.
+```powershell
+Set-Location -Path .\deepfake-insight-dash
+npm run dev
+```
+
+5) Open the app
+	- Visit http://localhost:8080 (or the port Vite reports).
+	- Upload a JPG/PNG. The UI will post the file to the local proxy which forwards it to Gemini and returns { filename, result, confidence }.
+
+Notes
+	- By default the frontend expects the proxy at `http://localhost:4001/api/detect`. Change `VITE_PROXY_URL` in `.env` if needed.
+	- Do NOT commit secrets in `.env` or `backend/.env`.
+	- Supabase writes are currently disabled; we can enable server-side saving behind an env flag if you want.
+
+That's it — the smallest steps to run locally. If you'd like, I can also add a one-file quicktest script to POST an image to the proxy for smoke tests.
+Environment variables (add to `.env` or your environment when running Vite):
+
+Frontend da : npm run dev --silent
+Backend da : $env:PORT='4001'; node server.js
