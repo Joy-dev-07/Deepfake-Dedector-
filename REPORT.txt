@@ -1,87 +1,397 @@
-# Deepfake Detector – Project Report
+Deepfake Detector – Project Report (with code references)
 
-## Executive summary
+Executive summary
 
 This project is a small, local-first deepfake checker. Users upload an image (or small video) via a React web app. A lightweight Node/Express proxy safely sends the file to Google Gemini (Generative Language API) and returns a normalized result: Real vs Fake with a confidence score. Optionally, the frontend saves a record of each detection to Supabase and displays the cloud-backed history.
 
-Key points:
+Key points:dir
 - Frontend: Vite + React + TypeScript (port 8080 by default)
 - Backend: Node + Express proxy (port 4001 by default)
 - AI: Google Generative Language API (Gemini) using HTTP generateContent
 - Storage: Supabase (optional) for history via browser (anon key)
 - Safety: API key stays server-side; browser uses a proxy for Gemini. Supabase writes are from the browser and require permissive RLS.
 
-## Repository structure
+Repository structure
 
-```
 d:\deepfake-detector
-├─ README.md                 # simple how-to-run guide (Windows)
-├─ REPORT.md                 # this report
-├─ backend/                  # Node/Express proxy (Gemini)
-│  ├─ .env                   # GEMINI_* and (disabled) SUPABASE backend flags
-│  ├─ package.json           # express, multer, axios, cors, dotenv
-│  └─ server.js              # POST /api/detect + (legacy) /api/history
-└─ deepfake-insight-dash/    # frontend (Vite React TS)
-   ├─ .env.example           # Vite config for proxy + Supabase client
-   ├─ package.json           # dev/build scripts
-   ├─ vite.config.ts         # host ::, port 8080
-   └─ src/
-      ├─ components/
-      │  ├─ UploadSection.tsx     # upload UI, calls proxy, then saves to Supabase
-      │  ├─ ResultsDisplay.tsx     # reads lastDetection from localStorage, instant UI
-      │  ├─ HistorySection.tsx     # reads history directly from Supabase
-      │  └─ Sidebar.tsx            # mirrors “Recent History” from Supabase
-      └─ lib/
-         ├─ api.ts                 # proxy call helper (Gemini via backend)
-         └─ supabase.ts            # Supabase client (browser)
+- README.md                 (how-to-run)
+- REPORT.txt                (this report)
+- backend/                  (Node/Express proxy)
+  - server.js               (Gemini proxy and history endpoints)
+- deepfake_frontend/        (Vite React TS)
+  - src/lib/api.ts          (proxy call helper for Gemini)
+  - src/lib/supabase.ts     (Supabase client for browser)
+  - src/components/UploadSection.tsx
+  - src/components/ResultsDisplay.tsx
+  - src/components/HistorySection.tsx
+  - src/components/Sidebar.tsx
+
+System architecture (text)
+1) Browser selects a file. 2) Frontend posts to local proxy /api/detect. 3) Proxy forwards base64 to Gemini generateContent. 4) Proxy returns { filename, result, confidence }. 5) Frontend updates localStorage for instant UI and inserts a row into Supabase for history. 6) History and Sidebar read recent rows directly from Supabase.
+
+Notes
+- 20 MB limit on both client and server.
+- History endpoints exist on the server, but current UI reads history directly from Supabase.
+
+============================================================
+REFERENCE CODE – BACKEND (server.js)
+============================================================
+
+1) Express + multer setup with 20 MB limit (why: safely accept uploads and cap size)
+
+```
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+
+const app = express();
+// Set a 20 MB file size limit for uploads
+const MAX_BYTES = 20 * 1024 * 1024;
+const upload = multer({ limits: { fileSize: MAX_BYTES } });
+const PORT = process.env.PORT || 4000;
+
+// Allow all origins in development to avoid CORS issues with varying Vite ports
+app.use(cors({ origin: true }));
 ```
 
-## System architecture
+2) Core detection endpoint (why: validate file, infer mime, build Gemini payload, normalize result)
 
-1) User selects a file in the browser (React app).
-2) Frontend posts the file (multipart/form-data) to the local proxy at `POST /api/detect`.
-3) Proxy converts file to base64 and calls Gemini (AI Studio Generative Language API `generateContent`).
-4) Proxy normalizes Gemini’s response to `{ filename, result, confidence }` and returns it.
-5) Frontend immediately:
-   - Updates `localStorage.lastDetection` so `ResultsDisplay` shows the result instantly.
-   - Inserts a new row in Supabase (file, result, confidence) so History is cloud-backed.
-6) History UI (table + sidebar) queries Supabase directly to show the latest entries.
+```
+app.post('/api/detect', upload.single('file'), async (req, res) => {
+  try {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    const geminiEndpoint = process.env.GEMINI_API_ENDPOINT;
+    if (!geminiKey || !geminiEndpoint) return res.status(500).json({ error: 'Gemini keys not configured on server' });
 
-Notes:
-- The backend also includes GET/DELETE `/api/history` (legacy). Current UI fetches history from Supabase directly.
-- Max upload size is 20 MB on both client and server to avoid heavy payloads.
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No file uploaded' });
 
-## Data flow diagrams (textual)
+    // Accept image/* or video/*; if mimetype missing, attempt extension-based detection
+    let mime = file.mimetype || '';
+    if (!mime && file.originalname) {
+      const ext = (file.originalname.split('.').pop() || '').toLowerCase();
+      if (['mp4','mov','webm','m4v','avi'].includes(ext)) mime = 'video/' + ext;
+      if (['jpg','jpeg','png','webp','gif'].includes(ext)) mime = 'image/' + ext;
+    }
 
-Upload/analysis:
-- Browser → POST /api/detect (file)
-- Proxy → Gemini generateContent (image/video inline_data)
-- Proxy → Browser response: `{ filename, result('Real'|'Fake'), confidence(number) }`
-- Browser → localStorage.lastDetection update for immediate UI
-- Browser → Supabase insert `{ file, result, confidence }`
+    const isImage = mime.startsWith('image/');
+    const isVideo = mime.startsWith('video/');
+    if (!isImage && !isVideo) {
+      return res.status(415).json({ error: 'Unsupported file type. Please upload an image (JPG/PNG) or a video (MP4, MOV, WEBM).', mime });
+    }
 
-History read:
-- Browser → Supabase select `select * from <table> order by created_at desc limit 200`
-- Browser UI renders both the list and the sidebar from this data
+    const b64 = file.buffer.toString('base64');
+    const promptText = isVideo
+      ? "You are a deepfake detection assistant. Analyze the uploaded video and determine if it is REAL or FAKE (AI-generated or manipulated). If possible, inspect motion artifacts, face/eye inconsistencies, frame blending, or other signs. Respond ONLY with compact JSON: { \"result\": \"Real\" or \"Fake\", \"confidence\": 0.xx }. Do not include any other text."
+      : "You are a deepfake detection assistant. Analyze the uploaded image and determine if it is REAL or FAKE (AI-generated or manipulated). Respond ONLY with compact JSON: { \"result\": \"Real\" or \"Fake\", \"confidence\": 0.xx }. Do not include any other text.";
 
-## Configuration
+    const payload = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: promptText },
+            { inline_data: { mime_type: mime || file.mimetype || 'application/octet-stream', data: b64 } }
+          ]
+        }
+      ]
+    };
+```
 
-Backend (`backend/.env`):
-- `PORT=4001`
-- `GEMINI_API_KEY=...` (required)
-- `GEMINI_API_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent` (default works)
-- `GEMINI_MODEL=gemini-1.5-flash` (fallbacks exist)
-- `SUPABASE_ENABLE=false` (frontend owns Supabase)
+Why:
+- Infer mime when missing so videos like .mp4 get accepted.
+- 20 MB guard prevents slow/expensive requests.
+- Prompt asks for compact JSON making response parsing reliable.
 
-Frontend (`deepfake-insight-dash/.env`):
-- `VITE_USE_PROXY=true`
-- `VITE_PROXY_URL=http://localhost:4001/api/detect`
-- `VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co` (optional)
-- `VITE_SUPABASE_ANON_KEY=YOUR-ANON-KEY` (optional)
-- `VITE_SUPABASE_TABLE=file_results` (default)
+3) Endpoint/model fallbacks and request (why: increase reliability across API versions/models)
 
-Supabase table (minimal schema used by this app):
-```sql
+```
+function buildCandidates(ep) {
+  const candidates = [];
+  const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+  const baseModels = [model, 'gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-1.5-pro-latest'];
+  const apiBases = ['https://generativelanguage.googleapis.com/v1beta', 'https://generativelanguage.googleapis.com/v1'];
+  for (const apiBase of apiBases) {
+    for (const m of baseModels) {
+      candidates.push(`${apiBase}/models/${m}:generateContent`);
+      if (!m.endsWith('-latest')) candidates.push(`${apiBase}/models/${m}-latest:generateContent`);
+    }
+  }
+  if (ep) candidates.unshift(ep);
+  return [...new Set(candidates)];
+}
+
+async function tryPost(endpoints) {
+  const errors = [];
+  for (const url of endpoints) {
+    try {
+      const r = await axios.post(url, payload, {
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+        params: { key: geminiKey },
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300) {
+        return { resp: r, used: url };
+      } else {
+        errors.push({ url, status: r.status, data: r.data });
+        if (r.status === 401 || r.status === 403) break;
+      }
+    } catch (e) {
+      errors.push({ url, error: e?.message || e });
+    }
+  }
+  const err = new Error('All Gemini endpoints failed');
+  err.details = errors;
+  throw err;
+}
+```
+
+Why:
+- Tries multiple API bases and model names to handle availability/version drift.
+- Adds error context to help troubleshoot failures.
+
+4) Response normalization (why: parse varied Gemini outputs to a stable {result, confidence})
+
+```
+function tryExtractJson(str) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    const start = str.indexOf('{');
+    const end = str.lastIndexOf('}');
+    if (start !== -1 && end !== -1 && end > start) {
+      try {
+        return JSON.parse(str.slice(start, end + 1));
+      } catch (e2) {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+function extractNormalized(data) {
+  const possible = ['predictions','outputs','results','response','output','candidates'];
+  for (const key of possible) {
+    if (data && Object.prototype.hasOwnProperty.call(data, key)) {
+      const val = data[key];
+      if (Array.isArray(val)) {
+        for (const v of val) {
+          if (typeof v === 'string') {
+            const j = tryExtractJson(v);
+            if (j && j.result) return j;
+          } else if (v && typeof v === 'object') {
+            if (v.content && Array.isArray(v.content.parts)) {
+              for (const p of v.content.parts) {
+                if (typeof p?.text === 'string') {
+                  const j = tryExtractJson(p.text);
+                  if (j && j.result) return j;
+                }
+              }
+            }
+            const text = v.text || v.content || v.output || null;
+            if (typeof text === 'string') {
+              const j = tryExtractJson(text);
+              if (j && j.result) return j;
+            }
+          }
+        }
+      } else if (typeof val === 'string') {
+        const j = tryExtractJson(val);
+        if (j && j.result) return j;
+      }
+    }
+  }
+  try {
+    const s = JSON.stringify(data);
+    const match = s.match(/\{[^{}]*\"result\"\s*:\s*\"(Real|Fake)[^\"]*\"[^{}]*\"confidence\"\s*:\s*([0-9.]+)[^{}]*\}/i);
+    if (match) {
+      const objStr = match[0]
+        .replace(/\\n/g, '')
+        .replace(/\\\"/g, '"');
+      const j = tryExtractJson(objStr);
+      if (j && j.result) return j;
+    }
+  } catch (e) { }
+  return null;
+}
+```
+
+Why:
+- Gemini responses vary; this logic finds embedded JSON regardless of nesting or formatting.
+
+5) Optional Supabase insert (why: record history in a shared table when enabled)
+
+```
+// Attempt to save to Supabase if enabled
+if (SUPABASE_ENABLE && supabase) {
+  try {
+    const insert = { file: out.filename, result: out.result, confidence: out.confidence };
+    const TABLE = process.env.SUPABASE_TABLE || 'file_results';
+    const { data: sdata, error: serror } = await supabase
+      .from(TABLE)
+      .insert([insert])
+      .select('*');
+    if (!serror && sdata && sdata[0]) {
+      out.id = sdata[0].id;
+      out.created_at = sdata[0].created_at;
+    }
+  } catch (e) {
+    // log warning
+  }
+}
+```
+
+6) History endpoints (why: convenience for server-side reads/deletes; UI currently uses client-side Supabase)
+
+```
+app.get('/api/history', async (req, res) => { /* select * order by created_at desc limit 200 */ });
+app.delete('/api/history', async (req, res) => { /* delete all rows (policy dependent) */ });
+```
+
+============================================================
+REFERENCE CODE – FRONTEND
+============================================================
+
+1) Gemini proxy helper (src/lib/api.ts) (why: prefer proxy to hide key and avoid CORS)
+
+```
+const USE_PROXY = (import.meta.env.VITE_USE_PROXY as string | undefined) === 'true';
+const PROXY_URL = import.meta.env.VITE_PROXY_URL || 'http://localhost:4001/api/detect';
+
+export async function analyzeImageWithGemini(file: File) {
+  if (USE_PROXY) {
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await fetch(PROXY_URL, { method: 'POST', body: form });
+    if (!resp.ok) { throw new Error(`Proxy error ${resp.status}: ${await resp.text()}`); }
+    const data = await resp.json();
+    if (!data || typeof data.result !== 'string') { throw new Error('Invalid proxy response'); }
+    return { result: data.result, confidence: Number(data.confidence) || 0, raw: data.raw };
+  }
+  // fallback path omitted here for brevity
+}
+```
+
+Why:
+- Sends multipart/form-data directly to backend’s /api/detect.
+- Returns normalized shape the UI expects.
+
+2) Supabase client (src/lib/supabase.ts) (why: simple browser client for history reads/writes)
+
+```
+import { createClient } from '@supabase/supabase-js';
+
+const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
+const anon = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
+
+export const supabase = url && anon ? createClient(url, anon) : null;
+export const SUPABASE_TABLE = (import.meta.env.VITE_SUPABASE_TABLE as string | undefined) || 'file_results';
+```
+
+Why:
+- Creates a client only when both URL and anon key exist.
+- Exports the table name with a sensible default.
+
+3) Upload flow (src/components/UploadSection.tsx) (why: validate file, size check, thumbnail, call Gemini, save local + Supabase)
+
+```
+// Enforce 20 MB file size limit
+const MAX_BYTES = 20 * 1024 * 1024;
+if (file.size > MAX_BYTES) { setError('File is too large. Maximum allowed size is 20 MB.'); return; }
+
+// Read thumbnail for images
+let thumb: string | undefined = undefined;
+if (isImage) {
+  thumb = await new Promise<string | undefined>((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => { const r = reader.result as string | null; resolve(r ?? undefined); };
+    reader.onerror = () => resolve(undefined);
+    reader.readAsDataURL(file);
+  });
+}
+
+// Call Gemini via proxy
+const res = await analyzeImageWithGemini(file);
+const detection = { filename: file.name, result: res.result, confidence: res.confidence, fileType: isImage ? 'image' : 'video', thumbnail: thumb };
+
+// Persist last detection locally for ResultsDisplay
+localStorage.setItem('lastDetection', JSON.stringify({ filename: detection.filename, result: detection.result, confidence: detection.confidence, fileType: detection.fileType, thumbnail: detection.thumbnail }));
+
+// Optional: write to Supabase history
+if (supabase) {
+  await supabase.from(SUPABASE_TABLE).insert([{ file: detection.filename, result: detection.result, confidence: detection.confidence }]);
+}
+```
+
+Why:
+- User experience: immediate thumbnail and local display without waiting on cloud.
+- Reliability: client-side insert to Supabase keeps history in sync with UI.
+
+4) Results display (src/components/ResultsDisplay.tsx) (why: single source of truth is localStorage.lastDetection)
+
+```
+const raw = localStorage.getItem('lastDetection');
+const parsed = raw ? JSON.parse(raw) : null;
+// Normalize confidence: expect 0-1 float; else treat as percent
+let confidenceRaw = Number(parsed.confidence || 0);
+let confidencePercent = confidenceRaw > 1 ? Math.round(confidenceRaw) : Math.round(confidenceRaw * 100);
+confidencePercent = Math.max(0, Math.min(100, confidencePercent));
+```
+
+Why:
+- Defensive handling for varied confidence scales from the model.
+- Keeps component logic decoupled from fetch/storage.
+
+5) History table (src/components/HistorySection.tsx) (why: cloud-backed history, optional clear)
+
+```
+const { data: rows } = await supabase
+  .from(SUPABASE_TABLE)
+  .select('*')
+  .order('created_at', { ascending: false })
+  .limit(200);
+
+// Optional delete (requires policy)
+await supabase.from(SUPABASE_TABLE).delete().neq('id', 0);
+```
+
+Why:
+- Reads latest rows; maps to UI friendly shape.
+- Clear action only works if your Supabase RLS allows DELETE.
+
+6) Sidebar recent (src/components/Sidebar.tsx) (why: quick glance list, mirrors History)
+
+```
+const { data, error } = await supabase
+  .from(SUPABASE_TABLE)
+  .select('*')
+  .order('created_at', { ascending: false })
+  .limit(20);
+```
+
+Why:
+- Lightweight query to show the 20 most recent detections.
+
+============================================================
+CONFIGURATION
+============================================================
+
+Backend (.env)
+- PORT=4001
+- GEMINI_API_KEY=...
+- GEMINI_API_ENDPOINT=https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent
+- GEMINI_MODEL=gemini-1.5-flash
+- SUPABASE_ENABLE=false (frontend owns Supabase)
+
+Frontend (.env)
+- VITE_USE_PROXY=true
+- VITE_PROXY_URL=http://localhost:4001/api/detect
+- VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co (optional)
+- VITE_SUPABASE_ANON_KEY=YOUR-ANON-KEY (optional)
+- VITE_SUPABASE_TABLE=file_results
+
+Supabase table (SQL)
 CREATE TABLE public.file_results (
   id          bigint primary key generated always as identity,
   file        text NOT NULL,
@@ -89,98 +399,333 @@ CREATE TABLE public.file_results (
   confidence  numeric,
   created_at  timestamp with time zone DEFAULT now()
 );
-
 ALTER TABLE public.file_results ENABLE ROW LEVEL SECURITY;
--- Allow SELECT/INSERT from the browser (anon key). Enable DELETE only if desired.
 CREATE POLICY "Allow anon select" ON public.file_results FOR SELECT TO anon USING (true);
 CREATE POLICY "Allow anon insert" ON public.file_results FOR INSERT TO anon WITH CHECK (true);
--- Optional (only if you really want Clear History from browser):
--- CREATE POLICY "Allow anon delete" ON public.file_results FOR DELETE TO anon USING (true);
-```
+-- Optional: DELETE policy if you want Clear History from browser
 
-## How to run (Windows, PowerShell)
+============================================================
+HOW TO RUN (Windows PowerShell)
+============================================================
 
-Backend proxy (one-time install then run):
-1. `cd d:\deepfake-detector\backend`
-2. `npm install`
-3. Ensure `.env` contains a valid `GEMINI_API_KEY`
-4. `node server.js` → expect: “Proxy listening on 4001”
+Backend proxy
+1) cd d:\deepfake-detector\backend
+2) npm install
+3) Ensure .env has GEMINI_API_KEY
+4) node server.js  (expect: Proxy listening on 4001)
 
-Frontend (one-time install then run):
-1. `cd d:\deepfake-detector\deepfake-insight-dash`
-2. `npm install`
-3. Create `.env` with Vite vars (see Configuration)
-4. `npm run dev` → open http://localhost:8080
+Frontend
+1) cd d:\deepfake-detector\deepfake_frontend
+2) npm install
+3) Create .env with Vite vars (see above)
+4) npm run dev  (open http://localhost:8080)
 
-Using the app:
-1. Click “Choose File” and select a small image (JPG/PNG) or small video (MP4)
-2. Wait for the result (ResultsDisplay shows immediately from localStorage)
-3. History and Sidebar refresh from Supabase if configured
+============================================================
+TROUBLESHOOTING
+============================================================
 
-## Frontend components
+- All Gemini endpoints failed → check GEMINI_API_KEY and endpoint; verify internet.
+- Unsupported file type → ensure image/* or video/*; rename uncommon extensions.
+- History not loading → set VITE_SUPABASE_URL/ANON_KEY and enable SELECT policy.
+- Clear History not working → add DELETE policy or remove the button.
+- Vite dev server not opening → ensure port 8080 is free.
 
-- `UploadSection.tsx`
-  - Validates file type + size (<= 20 MB)
-  - For images, reads a thumbnail data URL (stored locally for the Results view)
-  - Calls proxy → receives `{ result, confidence }`
-  - Saves `lastDetection` to localStorage for instant display
-  - Inserts `{ file, result, confidence }` into Supabase (if configured)
+End of report
 
-- `ResultsDisplay.tsx`
-  - Reads only `localStorage.lastDetection`
-  - Normalizes confidence to 0–100 and shows a progress bar & badge
+============================================================
+SOURCE CODE SAMPLES (Frontend & Backend)
+============================================================
 
-- `HistorySection.tsx`
-  - Fetches directly from Supabase: recent rows ordered by `created_at`
-  - Displays filename, result badge, confidence %, relative date
-  - Clear History calls a Supabase delete (policy must allow it)
-
-- `Sidebar.tsx`
-  - Mirrors History: fetches recent detections from Supabase
-  - Shows a compact list for quick glance
-
-## Backend endpoints
-
-- `POST /api/detect`
-  - Body: multipart/form-data with `file`
-  - Behavior: base64-encodes file → Gemini `generateContent`
-  - Response `{ filename, result, confidence, raw }`
-
-- `GET /api/history` and `DELETE /api/history`
-  - Legacy convenience endpoints (not used by the current UI)
-  - Current UI reads/writes history via Supabase directly
-
-## Security considerations
-
-- Do not expose Gemini API key in the browser. The proxy hides it server-side.
-- Supabase browser writes use the anon key + permissive RLS policies. Limit as needed.
-- Do not commit `.env` files with real secrets. Use local-only `.env` files.
-- Uploaded files are not stored server-side; they’re only forwarded to Gemini.
-- Large files are blocked at 20 MB to reduce risk/performance issues.
-
-## Limitations & known issues
-
-- Gemini video analysis via `inline_data` can be slow and/or size-limited. Prefer small files.
-- Confidence is model-derived; scaling is normalized, but values may vary by prompt/model.
-- Browser localStorage persists only the last detection (for instant UI). History is in Supabase if configured.
-- Without Supabase policies for SELECT/INSERT (and/or DELETE), history features won’t work in the browser.
-
-## Troubleshooting
-
-- “All Gemini endpoints failed”: check `GEMINI_API_KEY` and that the backend prints the endpoint it used. Ensure internet access and correct endpoint URL.
-- “Unsupported file type”: ensure the file is image/* or video/*; rename uncommon extensions to .jpg/.png/.mp4 if needed.
-- History not loading: ensure Vite env values are set (URL, anon key, table) and that Supabase SELECT policy is enabled.
-- Clear History not working: add a DELETE policy or remove the button.
-- Vite doesn’t open: verify the dev server is on 8080 and no firewall is blocking.
-
-## Next steps (nice-to-haves)
-
-- Generate and store a compressed thumbnail for faster history previews.
-- Add user auth to keep separate, private histories per user.
-- Add retries and backoff for Gemini and Supabase operations.
-- Add basic unit tests for response normalization and UI state.
-- Provide a small health-check page for the proxy.
+Below are the essential code excerpts requested. They are copied from the codebase and include short notes on why each part is important. You can paste these directly into Word.
 
 ---
+FRONTEND: Image/Video upload handler (UploadSection.tsx)
+---
+File: deepfake_frontend/src/components/UploadSection.tsx
 
-If you want this report in a different format (PDF outline, checklist, or slide-style), tell me the template and I’ll adapt the content.
+Why this matters:
+- Validates file type and size (<= 20MB)
+- Generates a thumbnail for images (nice UX)
+- Sends the file to the backend proxy for Gemini analysis
+- Saves a normalized result to localStorage and (optionally) Supabase
+
+```tsx
+// Inside UploadSection component
+const processFile = useCallback(async (file: File) => {
+  setError(null);
+  // Allow image or video mime types. If mime is missing, infer from extension.
+  const mime = file.type || '';
+  let isImage = mime.startsWith('image/');
+  let isVideo = mime.startsWith('video/');
+  if (!isImage && !isVideo && file.name) {
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    if (['mp4','mov','webm','m4v','avi'].includes(ext)) isVideo = true;
+    if (['jpg','jpeg','png','webp','gif'].includes(ext)) isImage = true;
+  }
+  if (!isImage && !isVideo) {
+    setError("Unsupported file type. Please upload an image (JPG/PNG) or a video (MP4, MOV). If your file has an uncommon extension, please rename it.");
+    return;
+  }
+
+  // Enforce 20 MB file size limit
+  const MAX_BYTES = 20 * 1024 * 1024;
+  if (file.size > MAX_BYTES) {
+    setError('File is too large. Maximum allowed size is 20 MB.');
+    return;
+  }
+
+  setLoading(true);
+  setResult(null);
+  try {
+    // Optional: create a thumbnail for images
+    const isImg = file.type.startsWith('image/');
+    let thumb: string | undefined = undefined;
+    if (isImg) {
+      thumb = await new Promise<string | undefined>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve((reader.result as string) ?? undefined);
+        reader.onerror = () => resolve(undefined);
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // Call Gemini via backend proxy
+    const res = await analyzeImageWithGemini(file);
+    const detection = {
+      filename: file.name,
+      result: res.result,
+      confidence: res.confidence,
+      fileType: isImg ? 'image' : 'video',
+      thumbnail: thumb,
+    };
+
+    setResult(detection);
+
+    // Persist last detection for ResultsDisplay
+    localStorage.setItem('lastDetection', JSON.stringify({
+      filename: detection.filename,
+      result: detection.result,
+      confidence: detection.confidence,
+      fileType: detection.fileType,
+      thumbnail: detection.thumbnail,
+    }));
+
+    // Optional: save to Supabase (if configured)
+    try {
+      if (supabase) {
+        const { error } = await supabase
+          .from(SUPABASE_TABLE)
+          .insert([{ file: detection.filename, result: detection.result, confidence: detection.confidence }]);
+        if (error) console.warn('Supabase insert (frontend) failed:', error.message || error);
+      }
+    } catch (e) {
+      console.warn('Supabase insert (frontend) exception:', (e as any)?.message || e);
+    }
+
+    if (onFileUpload) onFileUpload(file);
+  } catch (e: any) {
+    console.error('Analysis failed', e);
+    setError(e?.message || 'Analysis failed');
+  } finally {
+    setLoading(false);
+  }
+}, [onFileUpload]);
+```
+
+Also note the file picker accepts both images and videos:
+
+```tsx
+<input
+  type="file"
+  accept="image/*,video/*"
+  onChange={handleFileSelect}
+  className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+/> 
+```
+
+---
+FRONTEND: Proxy call helper (api.ts)
+---
+File: deepfake_frontend/src/lib/api.ts
+
+Why this matters:
+- Uses the local proxy by default (keeps Gemini key server-side)
+- Sends multipart/form-data and returns normalized result
+
+```ts
+const USE_PROXY = (import.meta.env.VITE_USE_PROXY as string | undefined) === 'true';
+const PROXY_URL = import.meta.env.VITE_PROXY_URL || 'http://localhost:4001/api/detect';
+
+export async function analyzeImageWithGemini(file: File) {
+  if (USE_PROXY) {
+    const form = new FormData();
+    form.append('file', file);
+    const resp = await fetch(PROXY_URL, { method: 'POST', body: form });
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(`Proxy error ${resp.status}: ${txt}`);
+    }
+    const data = await resp.json();
+    if (!data || typeof data.result !== 'string') {
+      throw new Error('Invalid proxy response');
+    }
+    return { result: data.result, confidence: Number(data.confidence) || 0, raw: data.raw };
+  }
+  // Direct-call fallback omitted (not recommended in browser)
+}
+```
+
+---
+BACKEND: Express /api/detect core
+---
+File: backend/server.js
+
+Why this matters:
+- Accepts a single uploaded file with multer (20MB max)
+- Infers MIME type from file name if needed (to support .mp4, .jpg, etc.)
+- Builds Gemini generateContent payload (inline_data base64)
+- Tries multiple endpoints/models and normalizes varied responses to a stable JSON
+
+```js
+app.post('/api/detect', upload.single('file'), async (req, res) => {
+  try {
+    const geminiKey = process.env.GEMINI_API_KEY;
+    const geminiEndpoint = process.env.GEMINI_API_ENDPOINT;
+    if (!geminiKey || !geminiEndpoint) return res.status(500).json({ error: 'Gemini keys not configured on server' });
+
+    const file = req.file;
+    if (!file) return res.status(400).json({ error: 'No file uploaded' });
+
+    // Infer mime when missing
+    let mime = file.mimetype || '';
+    if (!mime && file.originalname) {
+      const ext = (file.originalname.split('.').pop() || '').toLowerCase();
+      if (['mp4','mov','webm','m4v','avi'].includes(ext)) mime = 'video/' + ext;
+      if (['jpg','jpeg','png','webp','gif'].includes(ext)) mime = 'image/' + ext;
+    }
+    const isImage = mime.startsWith('image/');
+    const isVideo = mime.startsWith('video/');
+    if (!isImage && !isVideo) {
+      return res.status(415).json({ error: 'Unsupported file type. Please upload an image (JPG/PNG) or a video (MP4, MOV, WEBM).', mime });
+    }
+
+    const b64 = file.buffer.toString('base64');
+    const promptText = isVideo
+      ? "You are a deepfake detection assistant. Analyze the uploaded video and determine if it is REAL or FAKE (AI-generated or manipulated). If possible, inspect motion artifacts, face/eye inconsistencies, frame blending, or other signs. Respond ONLY with compact JSON: { \"result\": \"Real\" or \"Fake\", \"confidence\": 0.xx }."
+      : "You are a deepfake detection assistant. Analyze the uploaded image and determine if it is REAL or FAKE (AI-generated or manipulated). Respond ONLY with compact JSON: { \"result\": \"Real\" or \"Fake\", \"confidence\": 0.xx }.";
+
+    const payload = {
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: promptText },
+            { inline_data: { mime_type: mime || file.mimetype || 'application/octet-stream', data: b64 } }
+          ]
+        }
+      ]
+    };
+
+    // Try multiple endpoints/models
+    function buildCandidates(ep) {
+      const candidates = [];
+      const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+      const baseModels = [model, 'gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-1.5-pro-latest'];
+      const apiBases = ['https://generativelanguage.googleapis.com/v1beta', 'https://generativelanguage.googleapis.com/v1'];
+      for (const apiBase of apiBases) {
+        for (const m of baseModels) {
+          candidates.push(`${apiBase}/models/${m}:generateContent`);
+          if (!m.endsWith('-latest')) candidates.push(`${apiBase}/models/${m}-latest:generateContent`);
+        }
+      }
+      if (ep) candidates.unshift(ep);
+      return [...new Set(candidates)];
+    }
+
+    async function tryPost(endpoints) {
+      const errors = [];
+      for (const url of endpoints) {
+        try {
+          const r = await axios.post(url, payload, {
+            headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey },
+            params: { key: geminiKey },
+            validateStatus: () => true,
+          });
+          if (r.status >= 200 && r.status < 300) {
+            return { resp: r, used: url };
+          } else {
+            errors.push({ url, status: r.status, data: r.data });
+            if (r.status === 401 || r.status === 403) break;
+          }
+        } catch (e) {
+          errors.push({ url, error: e?.message || e });
+        }
+      }
+      const err = new Error('All Gemini endpoints failed');
+      err.details = errors;
+      throw err;
+    }
+
+    const { resp, used } = await tryPost(buildCandidates(geminiEndpoint));
+    if (used) console.log('[detect] using endpoint:', used);
+
+    // Normalize result
+    const raw = resp.data;
+    function tryExtractJson(str) {
+      try { return JSON.parse(str); } catch (_) {
+        const s = str; const start = s.indexOf('{'); const end = s.lastIndexOf('}');
+        if (start !== -1 && end !== -1 && end > start) { try { return JSON.parse(s.slice(start, end + 1)); } catch { return null; } }
+        return null;
+      }
+    }
+    function extractNormalized(data) {
+      const possible = ['predictions','outputs','results','response','output','candidates'];
+      for (const key of possible) {
+        if (data && Object.prototype.hasOwnProperty.call(data, key)) {
+          const val = data[key];
+          if (Array.isArray(val)) {
+            for (const v of val) {
+              if (typeof v === 'string') {
+                const j = tryExtractJson(v); if (j && j.result) return j;
+              } else if (v && typeof v === 'object') {
+                if (v.content && Array.isArray(v.content.parts)) {
+                  for (const p of v.content.parts) { if (typeof p?.text === 'string') { const j = tryExtractJson(p.text); if (j && j.result) return j; } }
+                }
+                const text = v.text || v.content || v.output || null;
+                if (typeof text === 'string') { const j = tryExtractJson(text); if (j && j.result) return j; }
+              }
+            }
+          } else if (typeof val === 'string') {
+            const j = tryExtractJson(val); if (j && j.result) return j;
+          }
+        }
+      }
+      try {
+        const s = JSON.stringify(data);
+        const match = s.match(/\{[^{}]*\"result\"\s*:\s*\"(Real|Fake)[^\"]*\"[^{}]*\"confidence\"\s*:\s*([0-9.]+)[^{}]*\}/i);
+        if (match) { const objStr = match[0].replace(/\\n/g, '').replace(/\\\"/g, '"'); const j = tryExtractJson(objStr); if (j && j.result) return j; }
+      } catch {}
+      return null;
+    }
+
+    const parsed = extractNormalized(raw) || { result: 'Unknown', confidence: 0 };
+    const out = {
+      filename: file.originalname,
+      result: parsed.result,
+      confidence: Number(parsed.confidence) || 0,
+      fileType: isVideo ? 'video' : 'image',
+      thumbnail: null,
+      raw,
+    };
+    return res.json(out);
+  } catch (err) {
+    const status = err?.response?.status;
+    const data = err?.response?.data;
+    console.error('Gemini proxy error:', status, data || err?.message || err);
+    res.status(500).json({ error: 'Gemini proxy error', status, details: data || (err?.message || err) });
+  }
+});
+```
+
+That’s it—these are the key source snippets for upload and backend detection. If you want me to include full file listings or more components (e.g., ResultsDisplay, HistorySection, Sidebar) in the report too, I can append them next.
+
