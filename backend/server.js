@@ -9,7 +9,8 @@ const app = express();
 // Set a 20 MB file size limit for uploads
 const MAX_BYTES = 20 * 1024 * 1024;
 const upload = multer({ limits: { fileSize: MAX_BYTES } });
-const PORT = process.env.PORT || 4000;
+// All config is now hardcoded. See README.md for details.
+const PORT = 4001;
 
 // Allow all origins in development to avoid CORS issues with varying Vite ports
 app.use(cors({ origin: true }));
@@ -17,16 +18,17 @@ app.use(cors({ origin: true }));
 app.post('/api/detect', upload.single('file'), async (req, res) => {
   try {
     // Initialize Supabase if configured
-    const SUPABASE_URL = process.env.SUPABASE_URL || (process.env.SUPABASE_HOST ? `https://${process.env.SUPABASE_HOST}` : undefined);
-    const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
-    const SUPABASE_ENABLE = (process.env.SUPABASE_ENABLE || 'false') === 'true';
+  const SUPABASE_URL = "https://gkktasascfqgzpqlydhh.supabase.co";
+  const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imdra3Rhc2FzY2ZxZ3pwcWx5ZGhoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTg0MzUxOTYsImV4cCI6MjA3NDAxMTE5Nn0.6svqc4_UKYT4QcGzkMfuwmGb4Guknb0dlaC3Vqga5ss";
+  const SUPABASE_ENABLE = false;
+  const SUPABASE_TABLE = "file_results";
     let supabase = null;
     if (SUPABASE_URL && SUPABASE_KEY) {
       supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
     }
-    const geminiKey = process.env.GEMINI_API_KEY;
-    const geminiEndpoint = process.env.GEMINI_API_ENDPOINT;
-    if (!geminiKey || !geminiEndpoint) return res.status(500).json({ error: 'Gemini keys not configured on server' });
+      const geminiKey = "AIzaSyBQISbE-JTOGQh0ui2gMJt3z_zyU98uD2I";
+      const geminiEndpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+      const geminiModel = "gemini-2.0-flash";
 
     const file = req.file;
     if (!file) return res.status(400).json({ error: 'No file uploaded' });
@@ -69,10 +71,10 @@ app.post('/api/detect', upload.single('file'), async (req, res) => {
         }
       ]
     };
-
+      // No need to check for env config, keys are hardcoded
     function buildCandidates(ep) {
       const candidates = [];
-      const model = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+      const model = "gemini-2.0-flash";
       const baseModels = [model, 'gemini-1.5-flash', 'gemini-1.5-flash-latest', 'gemini-1.5-pro', 'gemini-1.5-pro-latest'];
       const apiBases = ['https://generativelanguage.googleapis.com/v1beta', 'https://generativelanguage.googleapis.com/v1'];
       for (const apiBase of apiBases) {
@@ -81,7 +83,7 @@ app.post('/api/detect', upload.single('file'), async (req, res) => {
           if (!m.endsWith('-latest')) candidates.push(`${apiBase}/models/${m}-latest:generateContent`);
         }
       }
-      // Ensure env endpoint first if provided
+      // Ensure provided endpoint first if present
       if (ep) candidates.unshift(ep);
       // De-duplicate
       return [...new Set(candidates)];
